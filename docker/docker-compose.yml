@@ -1,0 +1,102 @@
+# docker-compose.yml
+# Node.js API + Postgres example with:
+# - named volumes (pgdata, uploads)
+# - an init helper service to fix upload volume ownership
+# - read-only app rootfs + writable mount for uploads
+# - tmpfs for /tmp
+# - healthchecks and sane restart policies
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16
+    container_name: app_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: example_password
+      POSTGRES_DB: appdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  upload-init:
+    # one-shot helper to ensure uploads volume is owned by UID 1000 (common for node)
+    image: busybox
+    container_name: upload_init
+    user: root
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        mkdir -p /app/uploads &&
+        chown -R 1000:1000 /app/uploads ||
+        true
+    volumes:
+      - uploads:/app/uploads
+    # do NOT restart; this is a one-off helper
+    restart: "no"
+    networks:
+      - backend
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: myapp:latest
+    container_name: app_api
+    restart: unless-stopped
+    depends_on:
+      - db
+      - upload-init        # note: depends_on controls start order, see caveats in explanation
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://postgres:example_password@db:5432/appdb
+    ports:
+      - "3000:3000"
+    # security: make rootfs read-only and only mount writable paths
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - uploads:/app/uploads        # writable app uploads
+      - ./config/production.yaml:/app/config/production.yaml:ro  # host config (read-only)
+    user: "1000:1000"              # run as non-root inside container
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - backend
+
+  nginx:
+    image: nginx:alpine
+    container_name: app_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - app
+    networks:
+      - backend
+
+volumes:
+  pgdata:
+    driver: local
+  uploads:
+    driver: local
+
+networks:
+  backend:
+    driver: bridge
